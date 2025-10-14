@@ -1,0 +1,6 @@
+{
+    "require": {
+        "phpmailer/phpmailer": "@stable",
+        "guzzlehttp/guzzle": "@stable"
+    }
+}

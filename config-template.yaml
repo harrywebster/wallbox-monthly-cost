@@ -1,0 +1,16 @@
+timezone: Europe/London
+email_report_to: "me@me.com"
+email_server:
+  from_address: "me@me.com"
+  from_name: "EV report"
+  smtp_username: "me@me.com"
+  smtp_password: "my-secret-password"
+  smtp_host: "smtp.my-email-host.com"
+  smtp_port: 465
+wallbox:
+  charger_user: "me@me.com"
+  charger_id: 11111111
+  username: "me@me.com"
+  password: "my-secret-password"
+exchangerate_host:
+  api_key: "aaabbbccc1112223344aaa"
