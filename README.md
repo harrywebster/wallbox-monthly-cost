@@ -7,7 +7,8 @@ Report via email last months EV charging cost for a given user and charger.
 Tested on Ubuntu 24.04 and PHP 8.3.
 
 ```bash
-apt-get install -y php-yaml php-composer
+apt-get update
+apt-get install -y php-yaml composer
 composer update
 ```
 
