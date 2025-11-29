@@ -15,16 +15,26 @@ use PHPMailer\PHPMailer\PHPMailer;
 // Flags:
 //   -u  Update JSON files (Wallbox sessions + exchange rate)
 //   -e  Email the report
+//   -s  Append data to Google Sheet
+//   -q  Quiet mode (no output except errors)
 //   -h  Show help
 //
 
+// Global quiet mode flag
+$GLOBALS['quiet'] = false;
+
 // ---------- CLI entry ----------
 (function (): void {
-    $opts = getopt('ueh');
+    $opts = getopt('uehsq');
 
     if (isset($opts['h'])) {
         printUsage();
         exit(0);
+    }
+
+    // Set quiet mode
+    if (isset($opts['q'])) {
+        $GLOBALS['quiet'] = true;
     }
 
     $conf = parseConfig(__DIR__ . '/config.yaml');
@@ -35,12 +45,23 @@ use PHPMailer\PHPMailer\PHPMailer;
     }
 
     [$summaryText, $perLineText, $kwhTotal, $gbpTotal] = buildReport($conf);
-    echo $perLineText;
-    echo $summaryText;
+    if (!$GLOBALS['quiet']) {
+        echo $perLineText;
+        echo $summaryText;
+    }
 
     if (isset($opts['e'])) {
         sendReportEmail($conf, $summaryText, $perLineText, $kwhTotal, $gbpTotal);
-        echo "Email sent successfully.\n";
+        if (!$GLOBALS['quiet']) {
+            echo "Email sent successfully.\n";
+        }
+    }
+
+    if (isset($opts['s'])) {
+        appendToGoogleSheet($conf, $kwhTotal, $gbpTotal);
+        if (!$GLOBALS['quiet']) {
+            echo "Data appended to Google Sheet successfully.\n";
+        }
     }
 })();
 
@@ -72,17 +93,22 @@ function printUsage(): void
     $self = basename(__FILE__);
     echo <<<TXT
 Usage:
-  php {$self} [-u] [-e] [-h]
+  php {$self} [-u] [-e] [-s] [-q] [-h]
 
 Flags:
   -u   Download latest Wallbox sessions and exchange rate JSON
   -e   Email a copy of the report
+  -s   Append data to Google Sheet
+  -q   Quiet mode (no output except errors, useful for cron)
   -h   Show this help
 
 Examples:
   php {$self} -u         # refresh JSON only
   php {$self} -e         # read existing JSON, print + email report
   php {$self} -u -e      # refresh JSON then print + email
+  php {$self} -u -s      # refresh JSON then append to Google Sheet
+  php {$self} -u -e -s   # refresh JSON, email report, and append to Google Sheet
+  php {$self} -u -s -q   # refresh JSON and append to sheet (quiet for cron)
 
 TXT;
 }
@@ -94,7 +120,9 @@ TXT;
  */
 function updateData(stdClass $conf): void
 {
-    echo "Updating data...\n";
+    if (!$GLOBALS['quiet']) {
+        echo "Updating data...\n";
+    }
 
     $http = new Client([
         'base_uri' => 'https://api.wall-box.com/',
@@ -118,7 +146,9 @@ function updateData(stdClass $conf): void
             __DIR__ . '/session.json',
             json_encode($session, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)
         );
-        echo "  • Sessions: session.json [ok]\n";
+        if (!$GLOBALS['quiet']) {
+            echo "  • Sessions: session.json [ok]\n";
+        }
     } catch (RequestException $e) {
         $body = $e->hasResponse() ? (string) $e->getResponse()->getBody() : $e->getMessage();
         fwrite(STDERR, "HTTP error (Wallbox): {$body}\n");
@@ -134,7 +164,9 @@ function updateData(stdClass $conf): void
             __DIR__ . '/exchange.json',
             json_encode($fx, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR)
         );
-        echo "  • Exchange rate: exchange.json [ok]\n";
+        if (!$GLOBALS['quiet']) {
+            echo "  • Exchange rate: exchange.json [ok]\n";
+        }
     } catch (Throwable $e) {
         fwrite(STDERR, "Error (FX): {$e->getMessage()}\n");
         exit(1);
@@ -359,5 +391,111 @@ HTML;
     } catch (MailerException $e) {
         fwrite(STDERR, "Email failed: {$mailer->ErrorInfo}\n");
         exit(4);
+    }
+}
+
+// ---------- Google Sheets ----------
+
+/**
+ * Append cost and kWh data to Google Sheet using OAuth.
+ */
+function appendToGoogleSheet(stdClass $conf, float $kwhTotal, float $gbpTotal): void
+{
+    $credentialsFile = (string) $conf->google->credentials_file;
+    $spreadsheetId   = (string) $conf->google->spreadsheet_id;
+    $sheetName       = (string) $conf->google->sheet_name;
+
+    $credentialsPath = __DIR__ . '/' . $credentialsFile;
+    if (!file_exists($credentialsPath)) {
+        fwrite(STDERR, "Missing credentials file: {$credentialsPath}\n");
+        exit(5);
+    }
+
+    try {
+        $client = new Google_Client();
+        $client->setApplicationName('EV Charge Report');
+        $client->setScopes([Google_Service_Sheets::SPREADSHEETS]);
+        $client->setAuthConfig($credentialsPath);
+        $client->setRedirectUri('http://localhost');
+        $client->setAccessType('offline');
+        $client->setPrompt('consent');
+
+        $tokenPath = __DIR__ . '/google_token.json';
+
+        // Load existing token or request new one
+        if (file_exists($tokenPath)) {
+            $accessToken = json_decode((string) file_get_contents($tokenPath), true, flags: JSON_THROW_ON_ERROR);
+            $client->setAccessToken($accessToken);
+        }
+
+        // Refresh token if expired
+        if ($client->isAccessTokenExpired()) {
+            if ($client->getRefreshToken()) {
+                $client->fetchAccessTokenWithRefreshToken($client->getRefreshToken());
+            } else {
+                // Request new authorization
+                $authUrl = $client->createAuthUrl();
+                echo "Open this URL in your browser and authorize:\n{$authUrl}\n\n";
+                echo "After authorizing, you'll be redirected to localhost (which will fail).\n";
+                echo "Copy the FULL URL from your browser's address bar and paste it here.\n";
+                echo "Paste the redirect URL: ";
+                $redirectUrl = trim((string) fgets(STDIN));
+
+                // Parse the authorization code from the URL
+                $urlParts = parse_url($redirectUrl);
+                parse_str($urlParts['query'] ?? '', $queryParams);
+                $authCode = $queryParams['code'] ?? '';
+
+                if (empty($authCode)) {
+                    throw new RuntimeException('No authorization code found in URL');
+                }
+
+                $accessToken = $client->fetchAccessTokenWithAuthCode($authCode);
+
+                if (isset($accessToken['error'])) {
+                    throw new RuntimeException('Error fetching access token: ' . ($accessToken['error_description'] ?? $accessToken['error']));
+                }
+            }
+
+            // Save the token
+            if (!file_exists(dirname($tokenPath))) {
+                mkdir(dirname($tokenPath), 0700, true);
+            }
+            file_put_contents($tokenPath, json_encode($client->getAccessToken(), JSON_THROW_ON_ERROR));
+        }
+
+        $service = new Google_Service_Sheets($client);
+
+        // Get current date
+        $tz = new DateTimeZone((string) $conf->timezone);
+        $currentDate = (new DateTimeImmutable('now', $tz))->format('Y-m-d');
+
+        // Find the last row with data
+        $readRange = "{$sheetName}!A:C";
+        $response = $service->spreadsheets_values->get($spreadsheetId, $readRange);
+        $existingValues = $response->getValues();
+        $lastRow = $existingValues ? count($existingValues) : 0;
+        $nextRow = $lastRow + 1;
+
+        // Prepare row data: [date, kWh, cost in GBP]
+        $values = [
+            [$currentDate, $kwhTotal, $gbpTotal]
+        ];
+
+        $body = new Google_Service_Sheets_ValueRange([
+            'values' => $values
+        ]);
+
+        $params = [
+            'valueInputOption' => 'USER_ENTERED'
+        ];
+
+        // Write to the specific next row
+        $writeRange = "{$sheetName}!A{$nextRow}:C{$nextRow}";
+        $service->spreadsheets_values->update($spreadsheetId, $writeRange, $body, $params);
+
+    } catch (Throwable $e) {
+        fwrite(STDERR, "Google Sheets error: {$e->getMessage()}\n");
+        exit(5);
     }
 }
