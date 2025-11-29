@@ -14,3 +14,8 @@ wallbox:
   password: "my-secret-password"
 exchangerate_host:
   api_key: "aaabbbccc1112223344aaa"
+google:
+  credentials_file: "my_google_client_secrets.json"
+  spreadsheet_id: "aaaabbbbcccc"
+  sheet_name: "sheet1"
+~

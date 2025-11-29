@@ -2,3 +2,6 @@ exchange.json
 session.json
 vendor
 composer.lock
+config.yaml
+google_token.json
+google_client_secrets.json
