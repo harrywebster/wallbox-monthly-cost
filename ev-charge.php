@@ -16,16 +16,18 @@ use PHPMailer\PHPMailer\PHPMailer;
 //   -u  Update JSON files (Wallbox sessions + exchange rate)
 //   -e  Email the report
 //   -s  Append data to Google Sheet
+//   -d  Daily mode (yesterday's data, default is month-to-date)
 //   -q  Quiet mode (no output except errors)
 //   -h  Show help
 //
 
-// Global quiet mode flag
+// Global flags
 $GLOBALS['quiet'] = false;
+$GLOBALS['daily'] = false;
 
 // ---------- CLI entry ----------
 (function (): void {
-    $opts = getopt('uehsq');
+    $opts = getopt('uehsdq');
 
     if (isset($opts['h'])) {
         printUsage();
@@ -37,6 +39,11 @@ $GLOBALS['quiet'] = false;
         $GLOBALS['quiet'] = true;
     }
 
+    // Set daily mode
+    if (isset($opts['d'])) {
+        $GLOBALS['daily'] = true;
+    }
+
     $conf = parseConfig(__DIR__ . '/config.yaml');
 
     // Always compute & print the report. Optionally update and/or email.
@@ -44,7 +51,8 @@ $GLOBALS['quiet'] = false;
         updateData($conf);
     }
 
-    [$summaryText, $perLineText, $kwhTotal, $gbpTotal] = buildReport($conf);
+    $fetchType = $GLOBALS['daily'] ? 'daily' : 'monthly';
+    [$summaryText, $perLineText, $kwhTotal, $gbpTotal] = buildReport($conf, $fetchType);
     if (!$GLOBALS['quiet']) {
         echo $perLineText;
         echo $summaryText;
@@ -58,7 +66,7 @@ $GLOBALS['quiet'] = false;
     }
 
     if (isset($opts['s'])) {
-        appendToGoogleSheet($conf, $kwhTotal, $gbpTotal);
+        appendToGoogleSheet($conf, $kwhTotal, $gbpTotal, $fetchType);
         if (!$GLOBALS['quiet']) {
             echo "Data appended to Google Sheet successfully.\n";
         }
@@ -93,22 +101,24 @@ function printUsage(): void
     $self = basename(__FILE__);
     echo <<<TXT
 Usage:
-  php {$self} [-u] [-e] [-s] [-q] [-h]
+  php {$self} [-u] [-e] [-s] [-d] [-q] [-h]
 
 Flags:
   -u   Download latest Wallbox sessions and exchange rate JSON
   -e   Email a copy of the report
   -s   Append data to Google Sheet
+  -d   Daily mode (yesterday's data, default is month-to-date)
   -q   Quiet mode (no output except errors, useful for cron)
   -h   Show this help
 
 Examples:
   php {$self} -u         # refresh JSON only
-  php {$self} -e         # read existing JSON, print + email report
-  php {$self} -u -e      # refresh JSON then print + email
-  php {$self} -u -s      # refresh JSON then append to Google Sheet
+  php {$self} -e         # read existing JSON, print + email report (month-to-date)
+  php {$self} -u -e      # refresh JSON then print + email (month-to-date)
+  php {$self} -u -s      # refresh JSON then append to Google Sheet (monthly)
+  php {$self} -u -d -s   # refresh JSON and append yesterday's data to Google Sheet
   php {$self} -u -e -s   # refresh JSON, email report, and append to Google Sheet
-  php {$self} -u -s -q   # refresh JSON and append to sheet (quiet for cron)
+  php {$self} -u -d -s -q # refresh JSON, append yesterday's data (quiet for daily cron)
 
 TXT;
 }
@@ -236,11 +246,12 @@ function fetchExchangeRate(string $apiKey, string $from, string $to, int|float $
 // ---------- Reporting ----------
 
 /**
- * Build a per-session report (this month, matching user) + totals.
+ * Build a per-session report + totals.
  *
+ * @param string $fetchType 'daily' for yesterday's data, 'monthly' for month-to-date
  * @return array{0:string,1:string,2:float,3:float} [summaryText, perLineText, totalKwh, totalGbp]
  */
-function buildReport(stdClass $conf): array
+function buildReport(stdClass $conf, string $fetchType = 'monthly'): array
 {
     $sessionPath  = __DIR__ . '/session.json';
     $exchangePath = __DIR__ . '/exchange.json';
@@ -263,7 +274,17 @@ function buildReport(stdClass $conf): array
 
     $tz           = new DateTimeZone((string) $conf->timezone);
     $targetEmail  = (string) $conf->wallbox->charger_user;
-    $todayLocal   = (new DateTimeImmutable('now', $tz))->format('Y-m');
+    $now          = new DateTimeImmutable('now', $tz);
+
+    // Determine date range based on fetch type
+    if ($fetchType === 'daily') {
+        // Yesterday's data
+        $targetDate = $now->modify('-1 day')->format('Y-m-d');
+    } else {
+        // Month-to-date
+        $targetMonth = $now->format('Y-m');
+    }
+
     $totalCostGbp = 0.0;
     $totalKwh     = 0.0;
 
@@ -295,9 +316,17 @@ function buildReport(stdClass $conf): array
         $endDayStr  = $endLocal->format('Y-m-d');
         $endMonth   = $endLocal->format('Y-m');
 
-        // Only include this month
-        if ($endMonth !== $todayLocal) {
-            continue;
+        // Filter by date range based on fetch type
+        if ($fetchType === 'daily') {
+            // Only include yesterday's sessions
+            if ($endDayStr !== $targetDate) {
+                continue;
+            }
+        } else {
+            // Only include this month
+            if ($endMonth !== $targetMonth) {
+                continue;
+            }
         }
 
         $activeMinutes = max(0, (int) round(($endTs - $startTs) / 60));
@@ -398,8 +427,10 @@ HTML;
 
 /**
  * Append cost and kWh data to Google Sheet using OAuth.
+ *
+ * @param string $fetchType 'daily' or 'monthly'
  */
-function appendToGoogleSheet(stdClass $conf, float $kwhTotal, float $gbpTotal): void
+function appendToGoogleSheet(stdClass $conf, float $kwhTotal, float $gbpTotal, string $fetchType = 'monthly'): void
 {
     $credentialsFile = (string) $conf->google->credentials_file;
     $spreadsheetId   = (string) $conf->google->spreadsheet_id;
@@ -471,15 +502,15 @@ function appendToGoogleSheet(stdClass $conf, float $kwhTotal, float $gbpTotal): 
         $currentDate = (new DateTimeImmutable('now', $tz))->format('Y-m-d');
 
         // Find the last row with data
-        $readRange = "{$sheetName}!A:C";
+        $readRange = "{$sheetName}!A:D";
         $response = $service->spreadsheets_values->get($spreadsheetId, $readRange);
         $existingValues = $response->getValues();
         $lastRow = $existingValues ? count($existingValues) : 0;
         $nextRow = $lastRow + 1;
 
-        // Prepare row data: [date, kWh, cost in GBP]
+        // Prepare row data: [date, kWh, cost in GBP, fetch type]
         $values = [
-            [$currentDate, $kwhTotal, $gbpTotal]
+            [$currentDate, $kwhTotal, $gbpTotal, $fetchType]
         ];
 
         $body = new Google_Service_Sheets_ValueRange([
@@ -491,7 +522,7 @@ function appendToGoogleSheet(stdClass $conf, float $kwhTotal, float $gbpTotal): 
         ];
 
         // Write to the specific next row
-        $writeRange = "{$sheetName}!A{$nextRow}:C{$nextRow}";
+        $writeRange = "{$sheetName}!A{$nextRow}:D{$nextRow}";
         $service->spreadsheets_values->update($spreadsheetId, $writeRange, $body, $params);
 
     } catch (Throwable $e) {
